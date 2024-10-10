@@ -1,0 +1,385 @@
+import pandas as pd
+import re
+from playwright.sync_api import sync_playwright
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
+# Set the base file path as a global variable
+base_file_path = 'C:/Users/dhibabu1/Desktop/RZSR 3.0/'
+
+# Load the new Excel files
+file_path_audit = f'{base_file_path}RZSR_audit_input.xlsx'
+print(f"Input file location: {file_path_audit}")
+
+# Load the Marketing Tag Lookup data
+lookup_file_path = f'{base_file_path}RZSR_lookup_input.xlsx'
+print(f"Lookup file location: {lookup_file_path}")
+
+# Load the DataFrames from the Excel file
+list_df = pd.read_excel(file_path_audit, sheet_name='List')
+journey_df = pd.read_excel(file_path_audit, sheet_name='Journey')
+marketing_tags_df = pd.read_excel(lookup_file_path, sheet_name='Marketing Tag')
+adobe_launch_df = pd.read_excel(lookup_file_path, sheet_name='Adobe Launch')
+print("Adobe Launch data loaded successfully.")
+
+# Function to add audit timestamps
+def add_audit_timestamps(df, start_time):
+    end_time = datetime.now()
+    df['audit_start_timestamp'] = start_time
+    df['audit_end_timestamp'] = end_time
+    return end_time
+
+# Capture the audit start timestamp
+audit_start_timestamp = datetime.now()
+
+# Function to extract and append journey URLs
+def extract_and_append_journey_urls(journey_df):
+    print("Extracting journey URLs...")
+    def _execute_playwright_commands(page_values):
+        urls = []
+        def run(playwright):
+            browser = playwright.chromium.launch(headless=True)  # Set to False for non-headless mode
+            context = browser.new_context()
+            page = context.new_page()
+            for command in page_values:
+                try:
+                    command = re.sub(r'(\.get_by_role\(.*?\))\.click\(\)', r'\1.nth(0).click()', command)
+                    exec(command.strip())
+                    urls.append(page.url)
+                except Exception as e:
+                    urls.append(f"Error executing command: {e}")
+                    print(f"Error executing command: {command.strip()}: {e}")
+            context.close()
+            browser.close()
+        with sync_playwright() as playwright:
+            run(playwright)
+        return urls
+
+    new_rows = []
+    for _, row in journey_df.iterrows():
+        journey_id = row['journey_id']
+        journey_name = row['journey_name']
+        pick_locator = row['journey_pick_locator']
+        page_values = re.findall(r'page\.[^\n]+', pick_locator)
+        urls = _execute_playwright_commands(page_values)
+        for url in urls:
+            new_rows.append({
+                'journey_id': journey_id,
+                'journey_name': journey_name,
+                'journey_url': url
+            })
+    return pd.DataFrame(new_rows)
+
+# Function to extract window properties and capture request URLs
+def extract_window_properties_and_requests(df, url_column, window_properties=None, capture_requests=False):
+    print("Extracting window properties and capturing request URLs...")
+    extracted_data = {prop: [] for prop in (window_properties or [])}
+    all_request_urls = [] if capture_requests else None
+
+    for index, row in df.iterrows():
+        url = row[url_column]
+        print(f"Processing URL: {url}")  # Progress statement
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)  # Set to False for non-headless mode
+            page = browser.new_page()
+            request_urls = [] if capture_requests else None
+            if capture_requests:
+                page.on('request', lambda request: request_urls.append(request.url))
+            try:
+                page.goto(url)
+                page.wait_for_load_state('networkidle')
+                if window_properties:
+                    for prop in window_properties:
+                        data = page.evaluate(f"""() => {{ return window['{prop}']; }}""")
+                        extracted_data[prop].append(data)
+            except Exception as e:
+                print(f"Error processing {url}: {e}")
+                if window_properties:
+                    for prop in window_properties:
+                        extracted_data[prop].append({})
+                if capture_requests:
+                    request_urls = []
+            finally:
+                browser.close()
+            if capture_requests:
+                all_request_urls.append(request_urls)
+
+    if window_properties:
+        for prop in window_properties:
+            df[f'{prop}_data'] = extracted_data[prop]
+    if capture_requests:
+        df['request_urls'] = all_request_urls
+    return df
+
+# Function to check request URLs against the marketing tags
+def check_request_urls(df, marketing_tags):
+    print("Checking request URLs against marketing tags...")
+    
+    # Filter marketing tags to only include valid entries
+    valid_tags = marketing_tags[marketing_tags['Validity'].str.lower() == 'yes']
+    
+    for index, row in df.iterrows():
+        request_urls = row['request_urls']  # Assuming this is a list of URLs
+        if isinstance(request_urls, str):
+            request_urls = eval(request_urls)  # Convert string representation to list if needed
+
+        # Iterate through each platform in valid marketing tags
+        for _, tag_row in valid_tags.iterrows():
+            platform = tag_row['Platform']
+            tag_request_url = tag_row['Request URL']
+            if pd.isna(tag_request_url) or tag_request_url == '':
+                df.at[index, f'{platform}_request_URL'] = 'Not part of the audit'
+            else:
+                if any(tag_request_url in url for url in request_urls):
+                    df.at[index, f'{platform}_request_URL'] = 'Present'
+                else:
+                    df.at[index, f'{platform}_request_URL'] = 'Absent'
+                    
+    return df
+
+# Function to check request URLs against Adobe Launch request URLs
+def check_adobe_launch_request_urls(df, adobe_launch_df):
+    print("Checking request URLs against Adobe Launch request URLs...")
+    adobe_launch_map = {row['Request URL']: row['Environment'] for _, row in adobe_launch_df.iterrows()}
+
+    for index, row in df.iterrows():
+        request_urls = row['request_urls']  # Assuming this is a list of URLs
+        if isinstance(request_urls, str):
+            request_urls = eval(request_urls)  # Convert string representation to list if needed
+
+        environment_found = None
+        for url in request_urls:
+            if url in adobe_launch_map:
+                environment_found = adobe_launch_map[url]
+                break
+        
+        df.at[index, 'adobe_launch_request_URL'] = environment_found if environment_found else 'Not part of the provided Launch IDs'
+    
+    return df
+
+# Function to extract parameters from Facebook request URLs
+def extract_facebook_parameters(df, request_column):
+    print("Extracting Facebook parameters (only those starting with 'cd') from request URLs...")
+
+    # Iterate through each row in the DataFrame
+    for index, row in df.iterrows():
+        request_urls = row[request_column]  # Assuming this is a list of URLs
+        if isinstance(request_urls, str):
+            request_urls = eval(request_urls)  # Convert string representation to list if needed
+        
+        # Initialize a dictionary to hold extracted parameters
+        facebook_params = {}
+        
+        # Flag to check if Facebook URL is found
+        facebook_url_found = False
+        
+        # Check each request URL
+        for url in request_urls:
+            if url.startswith("https://www.facebook.com/tr?id=") and "&ev=wbc" in url:
+                # Parse the URL and extract query parameters
+                parsed_url = urlparse(url)
+                query_params = parse_qs(parsed_url.query)
+                
+                # Filter parameters to only those starting with 'cd'
+                for key, value in query_params.items():
+                    if key.startswith('cd'):
+                        facebook_params[key] = value[0]  # Take the first value for each key
+                
+                # Indicate that we found a Facebook URL
+                facebook_url_found = True
+                break
+
+        # If no Facebook URL was found, populate empty values based on the query parameters
+        if not facebook_url_found:
+            # Populate the DataFrame with empty values for each key found in the query parameters of the found URL
+            if request_urls:
+                # Get the first URL again to extract keys dynamically
+                first_url = request_urls[0]
+                parsed_url = urlparse(first_url)
+                dynamic_query_params = parse_qs(parsed_url.query)
+                
+                # Use the keys from the dynamic_query_params
+                for key in dynamic_query_params.keys():
+                    df.at[index, key] = ''  # Populate with empty value
+
+        # Add new columns for each parameter found that starts with 'cd'
+        for key, value in facebook_params.items():
+            df.at[index, key] = value
+
+    return df
+
+# Function to extract 'u' parameters from gDataLayer_data
+def extract_u_parameters_from_gdatalayer(df, gDataLayer_column):
+    def extract_u_parameters(row):
+        u_params = {}
+        g_data_layer = row
+        
+        if not g_data_layer or not isinstance(g_data_layer, list):
+            return u_params  # Return empty dictionary if there's no data
+
+        for entry in g_data_layer:
+            if entry.get('1') == 'conversion' and '2' in entry:
+                u_params = {k: v for k, v in entry['2'].items() if k.startswith('u')}
+                break
+        return u_params
+
+    print("Extracting 'u' parameters from gDataLayer_data...")
+    u_params_df = df[gDataLayer_column].apply(extract_u_parameters).apply(pd.Series)
+    return pd.concat([df, u_params_df], axis=1)
+
+# Function to extract key-value pairs from pageDetails_data
+def extract_page_details(df, pageDetails_column):
+    print("Extracting page details...")
+    page_details_df = df[pageDetails_column].apply(pd.Series)
+    return pd.concat([df, page_details_df], axis=1)
+
+# Function to extract and merge ProductID dictionaries into the same columns
+def extract_product_id_reuse_columns(df, productID_column):
+    print("Extracting ProductID...")
+    def extract_product_id(row):
+        flattened_data = {}
+        if isinstance(row, list):
+            for product in row:
+                for key, value in product.items():
+                    if key not in flattened_data:
+                        flattened_data[key] = value
+                    else:
+                        flattened_data[key] += f", {value}"
+        return flattened_data
+
+    product_details_df = df[productID_column].apply(extract_product_id).apply(pd.Series)
+    return pd.concat([df, product_details_df], axis=1)
+
+# Function to create Adobe Launch output DataFrame
+def create_adobe_launch_output(df, adobe_launch_df):
+    print("Creating Adobe Launch output DataFrame...")
+    
+    output_data = []
+    adobe_launch_map = {row['Request URL']: row['Environment'] for _, row in adobe_launch_df.iterrows()}
+
+    for index, row in df.iterrows():
+        list_id = row['list_id']  # Assuming these columns exist in the base df
+        list_name = row['list_name']
+        list_url = row['list_url']
+        
+        request_urls = row['request_urls']  # Assuming this is a list of URLs
+        if isinstance(request_urls, str):
+            request_urls = eval(request_urls)  # Convert string representation to list if needed
+        
+        environment_found = None
+        result = 'Fail'  # Default result
+        
+        for url in request_urls:
+            if url in adobe_launch_map:
+                environment_found = adobe_launch_map[url]
+                result = 'Pass'  # Mark as Pass if any request URL matches
+                break
+        
+        output_data.append({
+            'list_id': list_id,
+            'list_name': list_name,
+            'list_url': list_url,
+            'Environment': environment_found if environment_found else 'Not part of the provided Launch IDs',
+            'request_URL': ', '.join(request_urls) if request_urls else 'No requests captured',
+            'result': result
+        })
+    
+    return pd.DataFrame(output_data)
+
+# Function to create Marketing Tags output DataFrame
+def create_marketing_tags_output(df, marketing_tags):
+    print("Creating Marketing Tags output DataFrame...")
+    
+    output_data = []
+    
+    # Filter marketing tags to only include valid entries
+    valid_tags = marketing_tags[marketing_tags['Validity'].str.lower() == 'yes']
+    
+    for index, row in df.iterrows():
+        list_id = row['list_id']  # Assuming these columns exist in the base df
+        list_name = row['list_name']
+        list_url = row['list_url']
+        
+        request_urls = row['request_urls']  # Assuming this is a list of URLs
+        if isinstance(request_urls, str):
+            request_urls = eval(request_urls)  # Convert string representation to list if needed
+        
+        # Check against valid marketing tags
+        for _, tag_row in valid_tags.iterrows():
+            platform = tag_row['Platform']
+            tag_request_url = tag_row['Request URL']
+            result = 'Absent'  # Default result
+            
+            if pd.isna(tag_request_url) or tag_request_url == '':
+                continue
+            
+            if any(tag_request_url in url for url in request_urls):
+                result = 'Present'  # Mark as Present if any request URL matches
+            
+            output_data.append({
+                'list_id': list_id,
+                'list_name': list_name,
+                'list_url': list_url,
+                'Marketing Tag': platform,
+                'request_URL': tag_request_url,
+                'result': result
+            })
+    
+    return pd.DataFrame(output_data)
+
+###############################################################################################################################################################################################################
+
+# Process list_df
+print("Processing list_df...")
+list_df = extract_window_properties_and_requests(list_df, 'list_url', window_properties=['gDataLayer', 'pageDetails'], capture_requests=True)
+list_df = check_request_urls(list_df, marketing_tags_df)  # Check request URLs
+list_df = check_adobe_launch_request_urls(list_df, adobe_launch_df)  # Check Adobe Launch URLs
+list_df = extract_facebook_parameters(list_df, 'request_urls')  # Extract Facebook parameters
+list_df = extract_u_parameters_from_gdatalayer(list_df, 'gDataLayer_data')
+list_df = extract_page_details(list_df, 'pageDetails_data')
+list_df = extract_product_id_reuse_columns(list_df, 'productID')
+
+# Add audit timestamps to list_df
+end_timestamp_list = add_audit_timestamps(list_df, audit_start_timestamp)
+
+# Save list_df to Excel with end timestamp in the filename
+output_file_list = f'{base_file_path}list_df_3.0_{end_timestamp_list.strftime("%Y%m%d_%H%M%S")}.xlsx'
+list_df.to_excel(output_file_list, index=False)
+print(f"Output file for list_df saved to: {output_file_list}")
+
+# Create Adobe Launch output DataFrame and save it to a new sheet in the same Excel file
+adobe_launch_output_df = create_adobe_launch_output(list_df, adobe_launch_df)
+
+# Create Marketing Tags output DataFrame and save it to a new sheet in the same Excel file
+marketing_tags_output_df = create_marketing_tags_output(list_df, marketing_tags_df)
+
+# Save both output DataFrames to new sheets in the same Excel file
+with pd.ExcelWriter(output_file_list, mode='a', engine='openpyxl') as writer:
+    adobe_launch_output_df.to_excel(writer, sheet_name='Adobe Launch Output', index=False)
+    marketing_tags_output_df.to_excel(writer, sheet_name='Marketing Tags Output', index=False)
+
+print(f"Adobe Launch and Marketing Tags output DataFrames saved to new sheets in: {output_file_list}")
+
+# Process journey_df
+print("Processing journey_df...")
+journey_df = extract_and_append_journey_urls(journey_df)
+journey_df = extract_window_properties_and_requests(journey_df, 'journey_url', window_properties=['gDataLayer', 'pageDetails'], capture_requests=True)
+journey_df = check_request_urls(journey_df, marketing_tags_df)  # Check request URLs
+journey_df = check_adobe_launch_request_urls(journey_df, adobe_launch_df)  # Check Adobe Launch URLs
+journey_df = extract_facebook_parameters(journey_df, 'request_urls')  # Extract Facebook parameters
+journey_df = extract_u_parameters_from_gdatalayer(journey_df, 'gDataLayer_data')
+journey_df = extract_page_details(journey_df, 'pageDetails_data')
+journey_df = extract_product_id_reuse_columns(journey_df, 'productID')
+
+# Add audit timestamps to journey_df
+end_timestamp_journey = add_audit_timestamps(journey_df, audit_start_timestamp)
+
+# Save journey_df to Excel with end timestamp in the filename
+output_file_journey = f'{base_file_path}journey_df_3.0_{end_timestamp_journey.strftime("%Y%m%d_%H%M%S")}.xlsx'
+journey_df.to_excel(output_file_journey, index=False)
+print(f"Output file for journey_df saved to: {output_file_journey}")
+
+# Calculate total run time
+total_run_time = datetime.now() - audit_start_timestamp
+print(f"Total run time: {total_run_time}")
+
