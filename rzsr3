@@ -1,86 +1,184 @@
 import pandas as pd
 import re
-from playwright.sync_api import sync_playwright
+import logging
+from playwright.sync_api import sync_playwright, TimeoutError
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
+import ast
+
+# ----------------- Configuration and Logging ----------------- #
 
 # Set the base file path as a global variable
-base_file_path = 'C:/Users/dhibabu1/Desktop/RZSR 3.0/'
+BASE_FILE_PATH = 'C:/Users/dhibabu1/Desktop/RZSR 3.0/'
 
-# Load the new Excel files
-file_path_audit = f'{base_file_path}RZSR_audit_input.xlsx'
-print(f"Input file location: {file_path_audit}")
+# Set up logging for better traceability and debugging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load the Marketing Tag Lookup data
-lookup_file_path = f'{base_file_path}RZSR_lookup_input.xlsx'
-print(f"Lookup file location: {lookup_file_path}")
 
-# Load the DataFrames from the Excel file
-list_df = pd.read_excel(file_path_audit, sheet_name='List')
-journey_df = pd.read_excel(file_path_audit, sheet_name='Journey')
-marketing_tags_df = pd.read_excel(lookup_file_path, sheet_name='Marketing Tag')
-adobe_launch_df = pd.read_excel(lookup_file_path, sheet_name='Adobe Launch')
-print("Adobe Launch data loaded successfully.")
+# ----------------- Utility Functions ----------------- #
 
-# Function to add audit timestamps
-def add_audit_timestamps(df, start_time):
+def load_sheets(file_path, sheet_names):
+    """
+    Helper function to load specific sheets from an Excel file.
+    Logs each sheet being loaded and handles errors if sheets are not found.
+    """
+    data = {}
+    logging.info(f"Loading file from {file_path}")
+    for sheet in sheet_names:
+        try:
+            data[sheet] = pd.read_excel(file_path, sheet_name=sheet)
+            logging.info(f"Successfully loaded sheet: {sheet}")
+        except ValueError:
+            logging.error(f"Sheet '{sheet}' not found in file: {file_path}")
+            raise ValueError(f"Sheet '{sheet}' not found in file: {file_path}")
+    return data
+
+def load_data(audit_filename='RZSR_audit_input.xlsx', lookup_filename='RZSR_lookup_input.xlsx', audit_sheets=None, lookup_sheets=None):
+    """
+    Loads the necessary sheets from the audit and lookup Excel files into DataFrames.
+    Uses 'load_sheets' to load the specified sheets and logs success or failure.
+    """
+    file_path_audit = f'{BASE_FILE_PATH}{audit_filename}'
+    file_path_lookup = f'{BASE_FILE_PATH}{lookup_filename}'
+
+    if audit_sheets is None:
+        audit_sheets = ['List', 'Journey']
+    if lookup_sheets is None:
+        lookup_sheets = ['Marketing Tag', 'Adobe Launch', 'Google', 'Meta', "Westpac's Data Layer"]
+    
+    data = {}
+
+    try:
+        # Load audit sheets
+        data.update(load_sheets(file_path_audit, audit_sheets))
+        # Load lookup sheets
+        data.update(load_sheets(file_path_lookup, lookup_sheets))
+        logging.info("All source data loaded successfully.")
+    except FileNotFoundError as e:
+        logging.error(f"Error loading file: {e}")
+        raise FileNotFoundError(f"Could not find file: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error while loading data: {e}")
+        raise
+
+    return data
+
+def clean_dataframes(*dataframes, replacement_value=''):
+    """
+    Cleans the provided DataFrames by replacing NaN, 'nan', and 'N/A' values with the specified replacement value.
+    Logs each DataFrame cleaning process and handles numeric vs. non-numeric columns properly.
+    """
+    cleaned_dataframes = []
+    logging.info(f"DataFrame to be cleaned with replacement value: {replacement_value}")
+    for df in dataframes:
+        cleaned_df = df.copy()
+        # Handle numeric columns if replacement_value is non-numeric
+        if not isinstance(replacement_value, (int, float)):
+            for column in cleaned_df.select_dtypes(include=[float, int]).columns:
+                cleaned_df[column] = cleaned_df[column].astype('object')
+        # Replace NaN, 'nan' strings, and 'N/A' values
+        cleaned_df.replace(['N/A', 'nan'], replacement_value, inplace=True)
+        cleaned_df.fillna(replacement_value, inplace=True)
+        cleaned_dataframes.append(cleaned_df)
+    return cleaned_dataframes
+
+def save_multiple_dataframes_to_excel(file_path, sheet_data):
+    """
+    Saves multiple DataFrames to a single Excel file with specified sheet names.
+    Logs each DataFrame being saved and handles PermissionError.
+    """
+    try:
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            for sheet_name, df in sheet_data.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                logging.info(f"Data saved to sheet: {sheet_name}")
+    except PermissionError:
+        logging.error(f"Permission denied: Could not save file at {file_path}. Please close the file if it is open and try again.")
+        raise
+    except Exception as e:
+        logging.error(f"Failed to save output file: {e}")
+        raise
+
+def add_audit_timestamps_to_dataframe(df, start_time):
+    """
+    Adds start and end timestamps to the DataFrame.
+    Logs the addition of timestamps to ensure traceability of the audit process.
+    """
     end_time = datetime.now()
-    df['audit_start_timestamp'] = start_time
-    df['audit_end_timestamp'] = end_time
-    return end_time
+    new_df = df.copy()
+    new_df['audit_start_timestamp'] = start_time
+    new_df['audit_end_timestamp'] = end_time
+    logging.info(f"Timestamps added: Start - {start_time}, End - {end_time}")
+    return new_df
 
-# Capture the audit start timestamp
-audit_start_timestamp = datetime.now()
 
-# Function to extract and append journey URLs
-def extract_and_append_journey_urls(journey_df):
-    print("Extracting journey URLs...")
-    def _execute_playwright_commands(page_values):
-        urls = []
-        def run(playwright):
-            browser = playwright.chromium.launch(headless=True)  # Set to False for non-headless mode
-            context = browser.new_context()
-            page = context.new_page()
-            for command in page_values:
-                try:
-                    command = re.sub(r'(\.get_by_role\(.*?\))\.click\(\)', r'\1.nth(0).click()', command)
-                    exec(command.strip())
-                    urls.append(page.url)
-                except Exception as e:
-                    urls.append(f"Error executing command: {e}")
-                    print(f"Error executing command: {command.strip()}: {e}")
-            context.close()
-            browser.close()
-        with sync_playwright() as playwright:
-            run(playwright)
-        return urls
+# ----------------- Playwright Functions ----------------- #
 
-    new_rows = []
-    for _, row in journey_df.iterrows():
-        journey_id = row['journey_id']
-        journey_name = row['journey_name']
-        pick_locator = row['journey_pick_locator']
-        page_values = re.findall(r'page\.[^\n]+', pick_locator)
-        urls = _execute_playwright_commands(page_values)
-        for url in urls:
-            new_rows.append({
-                'journey_id': journey_id,
-                'journey_name': journey_name,
-                'journey_url': url
-            })
-    return pd.DataFrame(new_rows)
+def safely_parse_request_urls(request_urls):
+    """
+    Safely parse request_urls column values into a list if they are stored as strings.
+    Logs errors for invalid string parsing.
+    """
+    if isinstance(request_urls, str):
+        try:
+            return ast.literal_eval(request_urls)
+        except (ValueError, SyntaxError) as e:
+            logging.error(f"Error parsing request_urls: {request_urls}. Error: {e}")
+            return []
+    return request_urls
 
-# Function to extract window properties and capture request URLs
-def extract_window_properties_and_requests(df, url_column, window_properties=None, capture_requests=False):
-    print("Extracting window properties and capturing request URLs...")
+def execute_playwright_commands_and_get_urls(page_values, retries=3):
+    """
+    Uses Playwright to execute commands and collect resulting URLs from browser actions.
+    Includes retry logic for failed operations and logs retries and errors.
+    """
+    urls = []
+
+    def run(playwright, retries):
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        
+        for command in page_values:
+            try:
+                command = re.sub(r'(\.get_by_role\(.*?\))\.click\(\)', r'\1.nth(0).click()', command)
+                exec(command.strip())  # Execute Playwright command
+                urls.append(page.url)
+                logging.info(f"Executed Playwright command, captured URL: {page.url}")
+            except TimeoutError as e:
+                if retries > 0:
+                    logging.warning(f"Timeout error occurred, retrying ({retries} attempts left): {e}")
+                    run(playwright, retries - 1)
+                else:
+                    urls.append(f"Error executing command due to timeout: {e}")
+                    logging.error(f"Max retries reached for command: {command.strip()} - {e}")
+            except Exception as e:
+                urls.append(f"Error executing command: {e}")
+                logging.error(f"Error executing command: {command.strip()} - {e}")
+        
+        context.close()
+        browser.close()
+
+    with sync_playwright() as playwright:
+        run(playwright, retries)
+
+    return urls
+
+def extract_window_props_and_requests(df, id_column, url_column, window_properties=None, capture_requests=False):
+    """
+    Extracts window properties and captures request URLs using Playwright for auditing.
+    Logs each ID and URL being processed along with errors encountered.
+    """
+    logging.info("Extracting window properties and capturing request URLs...")
     extracted_data = {prop: [] for prop in (window_properties or [])}
     all_request_urls = [] if capture_requests else None
 
     for index, row in df.iterrows():
+        id = row[id_column]
         url = row[url_column]
-        print(f"Processing URL: {url}")  # Progress statement
+        logging.info(f"Processing (ID: {id}, URL: {url})")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)  # Set to False for non-headless mode
+            browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             request_urls = [] if capture_requests else None
             if capture_requests:
@@ -93,7 +191,7 @@ def extract_window_properties_and_requests(df, url_column, window_properties=Non
                         data = page.evaluate(f"""() => {{ return window['{prop}']; }}""")
                         extracted_data[prop].append(data)
             except Exception as e:
-                print(f"Error processing {url}: {e}")
+                logging.error(f"Error processing {url}: {e}")
                 if window_properties:
                     for prop in window_properties:
                         extracted_data[prop].append({})
@@ -104,282 +202,586 @@ def extract_window_properties_and_requests(df, url_column, window_properties=Non
             if capture_requests:
                 all_request_urls.append(request_urls)
 
+    new_df = df.copy()
     if window_properties:
         for prop in window_properties:
-            df[f'{prop}_data'] = extracted_data[prop]
+            new_df[f'{prop}_data'] = extracted_data[prop]
     if capture_requests:
-        df['request_urls'] = all_request_urls
-    return df
+        new_df['request_urls'] = all_request_urls
+    return new_df
 
-# Function to check request URLs against the marketing tags
-def check_request_urls(df, marketing_tags):
-    print("Checking request URLs against marketing tags...")
-    
-    # Filter marketing tags to only include valid entries
-    valid_tags = marketing_tags[marketing_tags['Validity'].str.lower() == 'yes']
-    
-    for index, row in df.iterrows():
-        request_urls = row['request_urls']  # Assuming this is a list of URLs
-        if isinstance(request_urls, str):
-            request_urls = eval(request_urls)  # Convert string representation to list if needed
+def extract_journey_urls(df):
+    """
+    Extracts journey URLs from the journey DataFrame by executing Playwright commands.
+    Logs each journey ID and the URLs obtained during the process.
+    """
+    logging.info("Extracting journey_url based on user's navigation commands...")
+    new_rows = []
+    for _, row in df.iterrows():
+        journey_id = row['journey_id']
+        journey_name = row['journey_name']
+        pick_locator = row['journey_pick_locator']
+        page_values = re.findall(r'page\.[^\n]+', pick_locator)  # Extract Playwright commands
+        urls = execute_playwright_commands_and_get_urls(page_values)  # Execute commands and get URLs
+        for url in urls:
+            new_rows.append({
+                'journey_id': journey_id,
+                'journey_name': journey_name,
+                'journey_url': url
+            })
+    return pd.DataFrame(new_rows)
 
-        # Iterate through each platform in valid marketing tags
-        for _, tag_row in valid_tags.iterrows():
-            platform = tag_row['Platform']
-            tag_request_url = tag_row['Request URL']
-            if pd.isna(tag_request_url) or tag_request_url == '':
-                df.at[index, f'{platform}_request_URL'] = 'Not part of the audit'
-            else:
-                if any(tag_request_url in url for url in request_urls):
-                    df.at[index, f'{platform}_request_URL'] = 'Present'
-                else:
-                    df.at[index, f'{platform}_request_URL'] = 'Absent'
-                    
-    return df
 
-# Function to check request URLs against Adobe Launch request URLs
-def check_adobe_launch_request_urls(df, adobe_launch_df):
-    print("Checking request URLs against Adobe Launch request URLs...")
-    adobe_launch_map = {row['Request URL']: row['Environment'] for _, row in adobe_launch_df.iterrows()}
+# ----------------- Data Extraction Functions ----------------- #
 
-    for index, row in df.iterrows():
-        request_urls = row['request_urls']  # Assuming this is a list of URLs
-        if isinstance(request_urls, str):
-            request_urls = eval(request_urls)  # Convert string representation to list if needed
+def extract_facebook_parameters_from_requests(df, request_column):
+    """
+    Extracts Facebook 'cd' parameters from request URLs in the DataFrame.
+    Logs the extraction process for each URL and the extracted parameters.
+    """
+    logging.info("Extracting Facebook 'cd' parameters...")
+    new_df = df.copy()
 
-        environment_found = None
-        for url in request_urls:
-            if url in adobe_launch_map:
-                environment_found = adobe_launch_map[url]
-                break
-        
-        df.at[index, 'adobe_launch_request_URL'] = environment_found if environment_found else 'Not part of the provided Launch IDs'
-    
-    return df
-
-# Function to extract parameters from Facebook request URLs
-def extract_facebook_parameters(df, request_column):
-    print("Extracting Facebook parameters (only those starting with 'cd') from request URLs...")
-
-    # Iterate through each row in the DataFrame
-    for index, row in df.iterrows():
-        request_urls = row[request_column]  # Assuming this is a list of URLs
-        if isinstance(request_urls, str):
-            request_urls = eval(request_urls)  # Convert string representation to list if needed
-        
-        # Initialize a dictionary to hold extracted parameters
+    for index, row in new_df.iterrows():
+        request_urls = safely_parse_request_urls(row[request_column])
         facebook_params = {}
-        
-        # Flag to check if Facebook URL is found
-        facebook_url_found = False
-        
-        # Check each request URL
         for url in request_urls:
             if url.startswith("https://www.facebook.com/tr?id=") and "&ev=wbc" in url:
-                # Parse the URL and extract query parameters
                 parsed_url = urlparse(url)
                 query_params = parse_qs(parsed_url.query)
-                
-                # Filter parameters to only those starting with 'cd'
                 for key, value in query_params.items():
                     if key.startswith('cd'):
-                        facebook_params[key] = value[0]  # Take the first value for each key
-                
-                # Indicate that we found a Facebook URL
-                facebook_url_found = True
+                        facebook_params[key] = value[0]
                 break
+        for key in facebook_params.keys():
+            new_df.at[index, key] = facebook_params[key]
+    return new_df
 
-        # If no Facebook URL was found, populate empty values based on the query parameters
-        if not facebook_url_found:
-            # Populate the DataFrame with empty values for each key found in the query parameters of the found URL
-            if request_urls:
-                # Get the first URL again to extract keys dynamically
-                first_url = request_urls[0]
-                parsed_url = urlparse(first_url)
-                dynamic_query_params = parse_qs(parsed_url.query)
-                
-                # Use the keys from the dynamic_query_params
-                for key in dynamic_query_params.keys():
-                    df.at[index, key] = ''  # Populate with empty value
-
-        # Add new columns for each parameter found that starts with 'cd'
-        for key, value in facebook_params.items():
-            df.at[index, key] = value
-
-    return df
-
-# Function to extract 'u' parameters from gDataLayer_data
 def extract_u_parameters_from_gdatalayer(df, gDataLayer_column):
+    """
+    Extracts 'u' parameters from the gDataLayer column in the DataFrame.
+    Logs the extraction of parameters from each row.
+    """
     def extract_u_parameters(row):
         u_params = {}
         g_data_layer = row
-        
         if not g_data_layer or not isinstance(g_data_layer, list):
-            return u_params  # Return empty dictionary if there's no data
-
+            return u_params
         for entry in g_data_layer:
             if entry.get('1') == 'conversion' and '2' in entry:
                 u_params = {k: v for k, v in entry['2'].items() if k.startswith('u')}
                 break
         return u_params
-
-    print("Extracting 'u' parameters from gDataLayer_data...")
+    
+    logging.info("Extracting Google's 'u' parameters...")
     u_params_df = df[gDataLayer_column].apply(extract_u_parameters).apply(pd.Series)
     return pd.concat([df, u_params_df], axis=1)
 
-# Function to extract key-value pairs from pageDetails_data
-def extract_page_details(df, pageDetails_column):
-    print("Extracting page details...")
+def extract_page_details_from_dataframe(df, pageDetails_column):
+    """
+    Extracts key-value pairs from the pageDetails_data in a DataFrame.
+    Logs the extraction process for each row.
+    """
     page_details_df = df[pageDetails_column].apply(pd.Series)
+    logging.info("Page details extracted successfully.")
     return pd.concat([df, page_details_df], axis=1)
 
-# Function to extract and merge ProductID dictionaries into the same columns
-def extract_product_id_reuse_columns(df, productID_column):
-    print("Extracting ProductID...")
-    def extract_product_id(row):
+def extract_and_merge_multiple_dict_columns(df, dict_columns):
+    """
+    Extracts key-value pairs from one or more dictionary columns and merges them into the DataFrame.
+    Logs the extraction and merging process for the given columns.
+    """
+    if isinstance(dict_columns, str):
+        dict_columns = [dict_columns]
+
+    def extract_dict(row):
         flattened_data = {}
         if isinstance(row, list):
-            for product in row:
-                for key, value in product.items():
-                    if key not in flattened_data:
+            for item in row:
+                if isinstance(item, dict):
+                    for key, value in item.items():
                         flattened_data[key] = value
-                    else:
-                        flattened_data[key] += f", {value}"
+                else:
+                    logging.warning(f"Unexpected item type {type(item)} in list, skipping: {item}")
+        elif isinstance(row, dict):
+            for key, value in row.items():
+                flattened_data[key] = value
+        else:
+            logging.warning(f"Unexpected row type {type(row)}, expected list or dict.")
         return flattened_data
 
-    product_details_df = df[productID_column].apply(extract_product_id).apply(pd.Series)
-    return pd.concat([df, product_details_df], axis=1)
+    for column in dict_columns:
+        extracted_df = df[column].apply(extract_dict).apply(pd.Series)
+        df = pd.concat([df, extracted_df], axis=1)
+        logging.info(f"Extracted and merged dictionary from column: {column}")
 
-# Function to create Adobe Launch output DataFrame
-def create_adobe_launch_output(df, adobe_launch_df):
-    print("Creating Adobe Launch output DataFrame...")
-    
+    return df
+
+
+# ----------------- Audit and Output Functions ----------------- #
+
+def create_adobe_launch_output_dataframe(df, lookup_df):
+    """
+    Creates a DataFrame containing the Adobe Launch audit results.
+    Logs the presence or absence of Adobe Launch request URLs.
+    """
+    logging.info("Auditing for Adobe Launch's presence...")
+    adobe_launch_map = lookup_df.set_index('Request URL')['Environment'].to_dict()
+    adobe_launch_urls_set = set(adobe_launch_map.keys())
+
+    if 'list_id' in df.columns:
+        id_column, name_column, url_column = 'list_id', 'list_name', 'list_url'
+    elif 'journey_id' in df.columns:
+        id_column, name_column, url_column = 'journey_id', 'journey_name', 'journey_url'
+    else:
+        raise ValueError("DataFrame must contain either list_id or journey_id columns.")
+
     output_data = []
-    adobe_launch_map = {row['Request URL']: row['Environment'] for _, row in adobe_launch_df.iterrows()}
+    for _, row in df.iterrows():
+        request_urls = safely_parse_request_urls(row['request_urls'])
+        matched_request_urls = list(set(request_urls) & adobe_launch_urls_set)
+        environment_found = next((adobe_launch_map[url] for url in matched_request_urls), 'Not part of the provided Launch IDs')
+        result = 'Pass' if matched_request_urls else 'Fail'
 
-    for index, row in df.iterrows():
-        list_id = row['list_id']  # Assuming these columns exist in the base df
-        list_name = row['list_name']
-        list_url = row['list_url']
-        
-        request_urls = row['request_urls']  # Assuming this is a list of URLs
-        if isinstance(request_urls, str):
-            request_urls = eval(request_urls)  # Convert string representation to list if needed
-        
-        environment_found = None
-        result = 'Fail'  # Default result
-        
-        for url in request_urls:
-            if url in adobe_launch_map:
-                environment_found = adobe_launch_map[url]
-                result = 'Pass'  # Mark as Pass if any request URL matches
-                break
-        
         output_data.append({
-            'list_id': list_id,
-            'list_name': list_name,
-            'list_url': list_url,
-            'Environment': environment_found if environment_found else 'Not part of the provided Launch IDs',
-            'request_URL': ', '.join(request_urls) if request_urls else 'No requests captured',
+            id_column: row[id_column],
+            name_column: row[name_column],
+            url_column: row[url_column],
+            'environment': environment_found,
+            'request_url': ', '.join(matched_request_urls) if matched_request_urls else 'No matching URLs',
             'result': result
         })
-    
+
     return pd.DataFrame(output_data)
 
-# Function to create Marketing Tags output DataFrame
-def create_marketing_tags_output(df, marketing_tags):
-    print("Creating Marketing Tags output DataFrame...")
-    
+def create_marketing_tags_output_dataframe(df, lookup_df):
+    """
+    Creates a DataFrame containing Marketing Tags audit results.
+    Logs the presence or absence of marketing tags in the request URLs.
+    """
+    logging.info("Auditing Marketing Tags presence...")
+    valid_tags = lookup_df[lookup_df['Validity for Audit'].str.lower() == 'yes']
+
+    if 'list_id' in df.columns:
+        id_column, name_column, url_column = 'list_id', 'list_name', 'list_url'
+    elif 'journey_id' in df.columns:
+        id_column, name_column, url_column = 'journey_id', 'journey_name', 'journey_url'
+    else:
+        raise ValueError("DataFrame must contain either list_id or journey_id columns.")
+
     output_data = []
-    
-    # Filter marketing tags to only include valid entries
-    valid_tags = marketing_tags[marketing_tags['Validity'].str.lower() == 'yes']
-    
-    for index, row in df.iterrows():
-        list_id = row['list_id']  # Assuming these columns exist in the base df
-        list_name = row['list_name']
-        list_url = row['list_url']
-        
-        request_urls = row['request_urls']  # Assuming this is a list of URLs
-        if isinstance(request_urls, str):
-            request_urls = eval(request_urls)  # Convert string representation to list if needed
-        
-        # Check against valid marketing tags
+    for _, row in df.iterrows():
+        request_urls = safely_parse_request_urls(row['request_urls'])
+
         for _, tag_row in valid_tags.iterrows():
-            platform = tag_row['Platform']
-            tag_request_url = tag_row['Request URL']
-            result = 'Absent'  # Default result
-            
-            if pd.isna(tag_request_url) or tag_request_url == '':
+            if pd.isna(tag_row['Request URL']) or tag_row['Request URL'] == '':
                 continue
-            
-            if any(tag_request_url in url for url in request_urls):
-                result = 'Present'  # Mark as Present if any request URL matches
-            
+
+            result = 'Present' if any(tag_row['Request URL'] in url for url in request_urls) else 'Absent'
             output_data.append({
-                'list_id': list_id,
-                'list_name': list_name,
-                'list_url': list_url,
-                'Marketing Tag': platform,
-                'request_URL': tag_request_url,
+                id_column: row[id_column],
+                name_column: row[name_column],
+                url_column: row[url_column],
+                'marketing_tag': tag_row['Platform'],
+                'request_url': tag_row['Request URL'],
                 'result': result
             })
-    
+
     return pd.DataFrame(output_data)
 
-###############################################################################################################################################################################################################
+# ----------------- Audit Functions for Platform Parameters ----------------- #
 
-# Process list_df
-print("Processing list_df...")
-list_df = extract_window_properties_and_requests(list_df, 'list_url', window_properties=['gDataLayer', 'pageDetails'], capture_requests=True)
-list_df = check_request_urls(list_df, marketing_tags_df)  # Check request URLs
-list_df = check_adobe_launch_request_urls(list_df, adobe_launch_df)  # Check Adobe Launch URLs
-list_df = extract_facebook_parameters(list_df, 'request_urls')  # Extract Facebook parameters
-list_df = extract_u_parameters_from_gdatalayer(list_df, 'gDataLayer_data')
-list_df = extract_page_details(list_df, 'pageDetails_data')
-list_df = extract_product_id_reuse_columns(list_df, 'productID')
+def audit_parameters_across_platforms(df_parameters, df_westpac_datalayer, lookup_df, platform_type='facebook', fill_value=''):
+    """
+    Performs an audit between platform parameters (e.g., Facebook/Google) and Westpac DataLayer based on the lookup mappings.
+    Logs the audit process, results, and mismatches for each platform.
+    
+    Args:
+        df_parameters (pd.DataFrame): The parameters DataFrame (e.g., Facebook/Google).
+        df_westpac_datalayer (pd.DataFrame): The Westpac DataLayer DataFrame.
+        lookup_df (pd.DataFrame): The lookup DataFrame to match keys.
+        platform_type (str): Type of platform (e.g., 'facebook', 'google').
+        fill_value (str): Value to fill missing data with (default: empty string).
+        
+    Returns:
+        pd.DataFrame: Audit results as a new DataFrame.
+    """
+    audit_results = []
 
-# Add audit timestamps to list_df
-end_timestamp_list = add_audit_timestamps(list_df, audit_start_timestamp)
+    logging.info(f"Auditing for {platform_type} parameters...")
 
-# Save list_df to Excel with end timestamp in the filename
-output_file_list = f'{base_file_path}list_df_3.0_{end_timestamp_list.strftime("%Y%m%d_%H%M%S")}.xlsx'
-list_df.to_excel(output_file_list, index=False)
-print(f"Output file for list_df saved to: {output_file_list}")
+    platform_type = platform_type.lower()
+    key_col = f"{platform_type[0].upper()} Key"
+    value_col = f"{platform_type[0].upper()} Value"
+    key_col_out = f"{platform_type[0]}_key"
+    value_col_out = f"{platform_type[0]}_value"
 
-# Create Adobe Launch output DataFrame and save it to a new sheet in the same Excel file
-adobe_launch_output_df = create_adobe_launch_output(list_df, adobe_launch_df)
+    if platform_type not in ['facebook', 'google']:
+        raise ValueError(f"Unsupported platform_type: {platform_type}. Supported types are 'facebook' and 'google'.")
 
-# Create Marketing Tags output DataFrame and save it to a new sheet in the same Excel file
-marketing_tags_output_df = create_marketing_tags_output(list_df, marketing_tags_df)
+    if 'list_id' in df_parameters.columns:
+        id_column, name_column, url_column = 'list_id', 'list_name', 'list_url'
+    elif 'journey_id' in df_parameters.columns:
+        id_column, name_column, url_column = 'journey_id', 'journey_name', 'journey_url'
+    else:
+        raise ValueError("DataFrame must contain either 'list_id' or 'journey_id' columns.")
 
-# Save both output DataFrames to new sheets in the same Excel file
-with pd.ExcelWriter(output_file_list, mode='a', engine='openpyxl') as writer:
-    adobe_launch_output_df.to_excel(writer, sheet_name='Adobe Launch Output', index=False)
-    marketing_tags_output_df.to_excel(writer, sheet_name='Marketing Tags Output', index=False)
+    valid_lookup = lookup_df[lookup_df['Validity for Audit'].str.lower() == 'yes']
 
-print(f"Adobe Launch and Marketing Tags output DataFrames saved to new sheets in: {output_file_list}")
+    for _, mapping_row in valid_lookup.iterrows():
+        parameter_key, westpac_key = mapping_row[key_col], mapping_row['W Key']
 
-# Process journey_df
-print("Processing journey_df...")
-journey_df = extract_and_append_journey_urls(journey_df)
-journey_df = extract_window_properties_and_requests(journey_df, 'journey_url', window_properties=['gDataLayer', 'pageDetails'], capture_requests=True)
-journey_df = check_request_urls(journey_df, marketing_tags_df)  # Check request URLs
-journey_df = check_adobe_launch_request_urls(journey_df, adobe_launch_df)  # Check Adobe Launch URLs
-journey_df = extract_facebook_parameters(journey_df, 'request_urls')  # Extract Facebook parameters
-journey_df = extract_u_parameters_from_gdatalayer(journey_df, 'gDataLayer_data')
-journey_df = extract_page_details(journey_df, 'pageDetails_data')
-journey_df = extract_product_id_reuse_columns(journey_df, 'productID')
+        if parameter_key in df_parameters.columns and westpac_key in df_westpac_datalayer.columns:
+            parameter_values = df_parameters[parameter_key]
+            westpac_values = df_westpac_datalayer[westpac_key]
 
-# Add audit timestamps to journey_df
-end_timestamp_journey = add_audit_timestamps(journey_df, audit_start_timestamp)
+            for index, (parameter_value, westpac_value) in enumerate(zip(parameter_values, westpac_values)):
+                if parameter_value == '' and westpac_value == '':
+                    result = 'Missing Value'
+                elif parameter_value == '' or westpac_value == '' or str(parameter_value) != str(westpac_value):
+                    result = 'Fail'
+                else:
+                    result = 'Pass'
 
-# Save journey_df to Excel with end timestamp in the filename
-output_file_journey = f'{base_file_path}journey_df_3.0_{end_timestamp_journey.strftime("%Y%m%d_%H%M%S")}.xlsx'
-journey_df.to_excel(output_file_journey, index=False)
-print(f"Output file for journey_df saved to: {output_file_journey}")
+                audit_results.append({
+                    id_column: df_parameters.at[index, id_column],
+                    name_column: df_parameters.at[index, name_column],
+                    url_column: df_parameters.at[index, url_column],
+                    key_col_out: parameter_key,
+                    value_col_out: parameter_value,
+                    'w_key': westpac_key,
+                    'w_value': westpac_value,
+                    'result': result
+                })
 
-# Calculate total run time
-total_run_time = datetime.now() - audit_start_timestamp
-print(f"Total run time: {total_run_time}")
+    audit_df = pd.DataFrame(audit_results)
+    audit_df.fillna(fill_value, inplace=True)
 
+    return audit_df
+
+# ----------------- Audit Functions for Westpac Data Layer ----------------- #
+
+def audit_westpac_data_layer(df_westpac_datalayer, lookup_westpac_datalayer_df):
+    """
+    Audits the Westpac Data Layer (either List or Journey) based on the audit mappings defined in the lookup dataframe.
+    Logs every step, including mismatches, missing values, and invalid URLs.
+    
+    Args:
+        df_westpac_datalayer (pd.DataFrame): The dataframe to be audited (either List or Journey).
+        lookup_westpac_datalayer_df (pd.DataFrame): The lookup dataframe with audit rules and conditions.
+
+    Returns:
+        pd.DataFrame: A DataFrame with the audit results.
+    """
+    logging.info("Auditing of Westpac Data Layer...")
+
+    # Filter only valid keys for audit
+    valid_lookup = lookup_westpac_datalayer_df[lookup_westpac_datalayer_df['Validity for Audit'].str.lower() == 'yes']
+
+    # Create mappings from the lookup table for quick access during audit
+    audit_mappings = {
+        'type_of_audit': valid_lookup.set_index('Key')['Type of Audit'].to_dict(),
+        'possible_values': valid_lookup.set_index('Key')['Possible Values'].to_dict(),
+        'exceptable_values': valid_lookup.set_index('Key')['Exceptable Values'].to_dict(),
+        'url_directory': valid_lookup.set_index('Key')['URL Directory'].to_dict(),
+        'pattern': valid_lookup.set_index('Key')['Pattern'].to_dict()
+    }
+
+    def audit_if_one_product(value, productID):
+        # If both value and productID are empty or null-like, return "Pass"
+        if (pd.isna(value) or value == '' or value is None) and (pd.isna(productID).all() if isinstance(productID, (pd.Series, list)) else (productID == '' or productID is None or productID == [])):
+            return "Pass"
+
+        # Handle the case where productID is a string and needs to be parsed
+        if isinstance(productID, str):
+            try:
+                productID = ast.literal_eval(productID)
+            except (ValueError, SyntaxError):
+                return "Fail"
+        
+        # If value is empty, return "Pass" only if productID is empty or null-like
+        if pd.isna(value) or value == '' or value is None:
+            if isinstance(productID, (pd.Series, list)):
+                return "Pass" if pd.isna(productID).all() or productID == [] else "Fail"
+            return "Pass" if not productID or productID == [] else "Fail"
+        
+        # If value is non-empty, and productID is a list with exactly one item, which is a dict
+        if value and isinstance(productID, list) and len(productID) == 1 and isinstance(productID[0], dict):
+            return "Pass"
+        
+        return "Fail"
+
+    def audit_original_url_directory(url_value, list_url, expected_directory_value):
+        """
+        Audit whether the list_url matches the expected directory (either "whole" or specific segment).
+        """
+        parsed_url = urlparse(list_url)
+        stripped_url = parsed_url.scheme + "://" + parsed_url.netloc + parsed_url.path
+
+        if (pd.isna(url_value) or url_value == '') and expected_directory_value == "whole":
+            return "Fail"
+        
+        if expected_directory_value == 'whole':
+            return "Pass" if stripped_url.strip('/') == url_value.strip('/') else "Fail"
+        
+        elif isinstance(expected_directory_value, int):
+            url_segments = [parsed_url.netloc] + parsed_url.path.strip("/").split("/")
+            if expected_directory_value < len(url_segments):
+                return "Pass" if url_segments[expected_directory_value] == url_value else "Fail"
+            else:
+                return "Pass" if pd.isna(url_value) or url_value == '' else "Fail"
+        
+        return "Fail"
+
+    def audit_possible_or_exceptable(value, possible_values, exceptable_values):
+        possible_values_list = possible_values.split('|') if possible_values else []
+        exceptable_values_list = exceptable_values.split('|') if exceptable_values else []
+        
+        if value in exceptable_values_list:
+            return "Pass"
+        
+        if value in possible_values_list and value not in exceptable_values_list:
+            return "Incorrect Value"
+        
+        return "Fail"
+
+    def audit_dataframe(df, id_col, name_col, url_col, product_col, audit_mappings):
+        audit_results = []
+        
+        for key in valid_lookup['Key'].dropna():
+            if key in df.columns:
+                values = df[key]
+                ids = df[id_col]
+                names = df[name_col]
+                urls = df[url_col]
+                product_ids = df[product_col]
+                
+                audit_type = audit_mappings['type_of_audit'].get(key, '')
+                possible_values = audit_mappings['possible_values'].get(key, '')
+                exceptable_values = audit_mappings['exceptable_values'].get(key, '')
+                url_directory = audit_mappings['url_directory'].get(key, '')
+                pattern = audit_mappings['pattern'].get(key, '')
+
+                for index, value in values.items():
+                    parsed_url = urlparse(urls[index])
+                    
+                    if parsed_url.netloc != 'www.westpac.com.au':
+                        result = "Invalid URL"
+                    else:
+                        if audit_type == 'if present only one product':
+                            result = audit_if_one_product(value, product_ids[index])
+                        elif audit_type == 'from original URL Directory':
+                            result = audit_original_url_directory(value, urls[index], url_directory)
+                        elif audit_type == 'one the possible or exceptable values':
+                            result = audit_possible_or_exceptable(value, possible_values, exceptable_values)
+                        else:
+                            result = "Fail"
+                    
+                    audit_results.append({
+                        id_col: ids[index],
+                        name_col: names[index],
+                        url_col: urls[index],
+                        'productID_recorded': product_ids[index],
+                        'type_of_audit': audit_type,
+                        'possible_values': possible_values,
+                        'exceptable_values': exceptable_values,
+                        'url_directory': url_directory,
+                        'pattern': pattern,
+                        'key': key,
+                        'value': value,
+                        'result': result
+                    })
+
+        return pd.DataFrame(audit_results)
+
+    # Determine column names based on whether it's List or Journey data layer
+    if 'list_id' in df_westpac_datalayer.columns:
+        return audit_dataframe(df_westpac_datalayer, 'list_id', 'list_name', 'list_url', 'productID', audit_mappings)
+    elif 'journey_id' in df_westpac_datalayer.columns:
+        return audit_dataframe(df_westpac_datalayer, 'journey_id', 'journey_name', 'journey_url', 'productID', audit_mappings)
+    else:
+        raise ValueError("The provided DataFrame does not have the expected List or Journey columns.")
+  
+
+# ----------------- Function to Save All Results ----------------- #
+
+def save_audit_results_to_excel(output_file, list_dfs_dictionary, journey_dfs_dictionary):
+    """
+    Save all processed DataFrames for List and Journey data to an Excel file.
+    Logs each DataFrame saved and handles PermissionError if the file is open.
+
+    Args:
+        output_file (str): Path to the output Excel file.
+        list_dfs_dictionary (dict): Dictionary containing processed list data.
+        journey_dfs_dictionary (dict): Dictionary containing processed journey data.
+    """
+    try:
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            sheet_data = {
+                'List Data Layer': list_dfs_dictionary['list_df_westpac_datalayer'],
+                'List Adobe Launch': list_dfs_dictionary['list_df_adobe_launch_check'],
+                'List Marketing Tags': list_dfs_dictionary['list_df_marketing_tags_check'],
+                'List Meta Parameters': list_dfs_dictionary['list_df_facebook_audit'],
+                'List Google Parameters': list_dfs_dictionary['list_df_google_audit'],
+                'List Data Layer Audit': list_dfs_dictionary['list_df_westpac_datalayer_audit'],
+                'Journey Data Layer': journey_dfs_dictionary['journey_df_westpac_datalayer'],
+                'Journey Adobe Launch': journey_dfs_dictionary['journey_df_adobe_launch_check'],
+                'Journey Marketing Tags': journey_dfs_dictionary['journey_df_marketing_tags_check'],
+                'Journey Meta Parameters': journey_dfs_dictionary['journey_df_facebook_audit'],
+                'Journey Google Parameters': journey_dfs_dictionary['journey_df_google_audit'],
+                'Journey Data Layer Audit': journey_dfs_dictionary['journey_df_westpac_datalayer_audit']                
+            }
+
+            for sheet_name, df in sheet_data.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    except PermissionError:
+        logging.error(f"Permission denied: Could not save file at {output_file}. Please close the file if it is open and try again.")
+        raise
+    except Exception as e:
+        logging.error(f"Failed to save output file: {e}")
+        raise
+
+# ----------------- Processing functions ----------------- #
+
+def process_list_data(list_df, lookup_meta_df, lookup_adobe_launch_df, lookup_google_df, lookup_marketing_tags_df, lookup_westpac_datalayer_df, audit_start_timestamp):
+    """
+    Process the List data by extracting relevant information, auditing parameters, 
+    and preparing the DataFrames for output.
+    Logs every step of the data extraction and auditing process.
+    """
+    logging.info("Processing List sheet...")
+
+    start_time = datetime.now()
+    
+    # Extract window properties, request URLs, and parameters
+    list_df = extract_window_props_and_requests(list_df, 'list_id', 'list_url', window_properties=['gDataLayer', 'pageDetails'], capture_requests=True)
+    list_df_facebook_params = extract_facebook_parameters_from_requests(list_df, 'request_urls')
+    list_df_google_params = extract_u_parameters_from_gdatalayer(list_df, 'gDataLayer_data')
+    list_df_westpac_nested = extract_page_details_from_dataframe(list_df, 'pageDetails_data')
+    list_df_westpac_datalayer = extract_and_merge_multiple_dict_columns(list_df_westpac_nested, 'productID')
+
+    # Clean DataFrames
+    list_df, list_df_facebook_params, list_df_google_params, list_df_westpac_datalayer = clean_dataframes(
+        list_df, list_df_facebook_params, list_df_google_params, list_df_westpac_datalayer, replacement_value=''
+    )
+
+    # Audit and prepare output DataFrames
+    list_df_adobe_launch_check = create_adobe_launch_output_dataframe(list_df, lookup_adobe_launch_df)
+    list_df_marketing_tags_check = create_marketing_tags_output_dataframe(list_df, lookup_marketing_tags_df)
+    list_df_facebook_audit = audit_parameters_across_platforms(list_df_facebook_params, list_df_westpac_datalayer, lookup_meta_df, platform_type='facebook', fill_value='N/A')
+    list_df_google_audit = audit_parameters_across_platforms(list_df_google_params, list_df_westpac_datalayer, lookup_google_df, platform_type='google', fill_value='N/A')
+    list_df_westpac_datalayer_audit = audit_westpac_data_layer(list_df_westpac_datalayer, lookup_westpac_datalayer_df)
+    
+    # Add audit timestamps
+    list_df = add_audit_timestamps_to_dataframe(list_df, audit_start_timestamp)
+
+    end_time = datetime.now()
+    logging.info(f"Finished processing list data at {end_time}. Total time: {end_time - start_time}")
+
+    return {
+        'list_df': list_df,
+        'list_df_westpac_datalayer': list_df_westpac_datalayer,
+        'list_df_adobe_launch_check': list_df_adobe_launch_check,
+        'list_df_marketing_tags_check': list_df_marketing_tags_check,
+        'list_df_facebook_audit': list_df_facebook_audit,
+        'list_df_google_audit': list_df_google_audit,
+        'list_df_westpac_datalayer_audit': list_df_westpac_datalayer_audit
+    }
+
+def process_journey_data(journey_df, lookup_meta_df, lookup_adobe_launch_df, lookup_google_df, lookup_marketing_tags_df, lookup_westpac_datalayer_df, audit_start_timestamp):
+    """
+    Process the Journey data by extracting relevant information, auditing parameters, 
+    and preparing the DataFrames for output.
+    Logs every step of the data extraction and auditing process.
+    """
+    logging.info("Processing Journey sheet...")
+
+    start_time = datetime.now()
+
+    # Extract journey URLs, window properties, and parameters
+    journey_df = extract_journey_urls(journey_df)
+    journey_df = extract_window_props_and_requests(journey_df, 'journey_id', 'journey_url', window_properties=['gDataLayer', 'pageDetails'], capture_requests=True)
+    journey_df_facebook_params = extract_facebook_parameters_from_requests(journey_df, 'request_urls')
+    journey_df_google_params = extract_u_parameters_from_gdatalayer(journey_df, 'gDataLayer_data')
+    journey_df_westpac_nested = extract_page_details_from_dataframe(journey_df, 'pageDetails_data')
+    journey_df_westpac_datalayer = extract_and_merge_multiple_dict_columns(journey_df_westpac_nested, 'productID')
+
+    # Clean DataFrames
+    journey_df, journey_df_facebook_params, journey_df_google_params, journey_df_westpac_datalayer = clean_dataframes(
+        journey_df, journey_df_facebook_params, journey_df_google_params, journey_df_westpac_datalayer, replacement_value=''
+    )
+
+    # Audit and prepare output DataFrames
+    journey_df_adobe_launch_check = create_adobe_launch_output_dataframe(journey_df, lookup_adobe_launch_df)
+    journey_df_marketing_tags_check = create_marketing_tags_output_dataframe(journey_df, lookup_marketing_tags_df)
+    journey_df_facebook_audit = audit_parameters_across_platforms(journey_df_facebook_params, journey_df_westpac_datalayer, lookup_meta_df, platform_type='facebook', fill_value='N/A')
+    journey_df_google_audit = audit_parameters_across_platforms(journey_df_google_params, journey_df_westpac_datalayer, lookup_google_df, platform_type='google', fill_value='N/A')
+    journey_df_westpac_datalayer_audit = audit_westpac_data_layer(journey_df_westpac_datalayer, lookup_westpac_datalayer_df)
+
+    # Add audit timestamps
+    journey_df = add_audit_timestamps_to_dataframe(journey_df, audit_start_timestamp)
+
+    end_time = datetime.now()
+    logging.info(f"Finished processing journey data at {end_time}. Total time: {end_time - start_time}")
+
+    return {
+        'journey_df': journey_df,
+        'journey_df_westpac_datalayer': journey_df_westpac_datalayer,
+        'journey_df_adobe_launch_check': journey_df_adobe_launch_check,
+        'journey_df_marketing_tags_check': journey_df_marketing_tags_check,
+        'journey_df_facebook_audit': journey_df_facebook_audit,
+        'journey_df_google_audit': journey_df_google_audit,
+        'journey_df_westpac_datalayer_audit': journey_df_westpac_datalayer_audit
+    }
+
+
+# ----------------- Main Processing ----------------- #
+
+def main():
+    """
+    Main function that drives the entire audit process.
+    Logs the start and end of the process, including total runtime.
+    """
+    # Capture the audit start timestamp
+    audit_start_timestamp = datetime.now()
+    logging.info("Starting the audit process...")
+
+    # Load source data
+    data = load_data('RZSR_audit_input.xlsx', 'RZSR_lookup_input.xlsx')
+
+    # Create necessary DataFrames
+    list_df = data['List']                        
+    journey_df = data['Journey']                  
+    lookup_meta_df = data['Meta']
+    lookup_adobe_launch_df = data['Adobe Launch']
+    lookup_google_df = data['Google']
+    lookup_marketing_tags_df = data['Marketing Tag']
+    lookup_westpac_datalayer_df = data["Westpac's Data Layer"]
+
+    # Clean lookup DataFrames
+    lookup_meta_df, lookup_google_df, lookup_adobe_launch_df, lookup_westpac_datalayer_df = clean_dataframes(
+        lookup_meta_df, lookup_google_df, lookup_adobe_launch_df, lookup_westpac_datalayer_df, replacement_value=''
+    )
+
+
+    # Process List Data
+    list_dfs_dictionary = process_list_data(list_df, lookup_meta_df, lookup_adobe_launch_df, lookup_google_df, lookup_marketing_tags_df, lookup_westpac_datalayer_df, audit_start_timestamp)
+
+    # Process Journey Data
+    journey_dfs_dictionary = process_journey_data(journey_df, lookup_meta_df, lookup_adobe_launch_df, lookup_google_df, lookup_marketing_tags_df, lookup_westpac_datalayer_df, audit_start_timestamp)
+
+    # Use the final timestamp from journey processing for output file name
+    final_timestamp = datetime.now()
+
+    # Save all DataFrames to an Excel file
+    output_file = f'{BASE_FILE_PATH}RZSR_audit_output_{final_timestamp.strftime("%Y%m%d_%H%M%S")}.xlsx'
+    save_audit_results_to_excel(output_file, list_dfs_dictionary, journey_dfs_dictionary)
+
+    logging.info(f"Output file saved: {output_file}")
+
+    # Calculate and log the total run time
+    total_run_time = final_timestamp - audit_start_timestamp
+    logging.info(f"Total run time: {total_run_time}")
+
+if __name__ == "__main__":
+    main()
